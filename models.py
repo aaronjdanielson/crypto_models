@@ -30,8 +30,7 @@ class Config:
 
 class BaselineModel(nn.Module):
     """
-    Temporal Fusion Transformer adapted for data from CryptoDataset.
-    Processes historical and future (known) data without static covariates.
+    BaselineModel for data from CryptoDataset.
 
     Parameters:
     ----------
@@ -133,4 +132,5 @@ class BaselineModel(nn.Module):
 
 
         return weighted_prices
+
  
