@@ -86,6 +86,19 @@ def plot_predictions(
         plt.legend()
         plt.show()
 
+def compute_market_cap_to_volume_ratio(market_cap: torch.Tensor, volume: torch.Tensor) -> torch.Tensor:
+    """
+    Compute Market Cap to Volume Ratio.
+    
+    Args:
+        market_cap (torch.Tensor): Shape [batch_size, num_cryptos]
+        volume (torch.Tensor): Shape [batch_size, num_cryptos]
+    
+    Returns:
+        torch.Tensor: Ratio of Market Cap to Trading Volume.
+    """
+    return market_cap / (volume + 1e-8)  # Avoid division by zero
+
 
 def bollinger_bands(x: torch.Tensor, window: int = 20, k: float = 2.0) -> dict:
     """
@@ -613,6 +626,42 @@ def compute_rsi(x: torch.Tensor, period: int = 14) -> torch.Tensor:
     rsi = 100 - 100 / (1 + RS)
     
     return rsi
+
+def compute_market_cap_adjusted_rsi(close_prices, market_caps, period=14):
+    """
+    Compute Market Cap Adjusted RSI.
+    
+    Args:
+        close_prices (torch.Tensor): Shape [batch_size, num_cryptos, lookback]
+        market_caps (torch.Tensor): Shape [batch_size, num_cryptos]
+        period (int): Lookback period for RSI.
+    
+    Returns:
+        torch.Tensor: Adjusted RSI per crypto.
+    """
+    # Compute price differences
+    delta = close_prices[..., 1:] - close_prices[..., :-1]
+    
+    # Compute U (up) and D (down) movements
+    U = torch.clamp(delta, min=0)
+    D = torch.clamp(-delta, min=0)
+    
+    # Weight up/down movements by market cap
+    market_cap_weights = market_caps / market_caps.sum(dim=-1, keepdim=True)
+    U_weighted = U * market_cap_weights.unsqueeze(-1)
+    D_weighted = D * market_cap_weights.unsqueeze(-1)
+
+    # Compute moving average (exponential smoothing)
+    alpha = 1.0 / period
+    smma_U = (U_weighted * alpha).sum(dim=-1)
+    smma_D = (D_weighted * alpha).sum(dim=-1)
+
+    # Compute Relative Strength Index (RSI)
+    RS = smma_U / (smma_D + 1e-8)  # Avoid division by zero
+    rsi = 100 - (100 / (1 + RS))
+
+    return rsi
+
 
 # def compute_stochastic_oscillator(x: torch.Tensor, period: int = 14) -> torch.Tensor:
 #     """
