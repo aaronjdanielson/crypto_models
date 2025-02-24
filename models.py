@@ -4,7 +4,7 @@ from torch import nn
 import torch.nn.functional as F
 import math
 from typing import List, Dict, Tuple, Optional, Any
-from functions import statistical_bollinger_bands, compute_obv
+from functions import statistical_bollinger_bands, compute_obv, compute_stochastic_oscillator
 from modules import MLPBlock
 #from modules import ExpDecayLinearRegressionSlope, ChannelTimeFusion, DynamicHorizonScaler
 
@@ -89,23 +89,9 @@ class BaselineModel(nn.Module):
         Forward pass using historical and future data from the batch.
         """
         historical_data = batch['historical_data']  # Shape: [batch_size, num_channel, lookback, num_historical_features]
-        # time_features = batch['time_features']  # Shape: [batch_size, lookback + horizon, num_future_features]
-        # close_prices = historical_data[:, :, :, 3]
-        # high_prices = historical_data[:, :, :, 1]
-        # low_prices = historical_data[:, :, :, 2]
-        # open_prices = historical_data[:, :, :, 0]
-
-        # **Step 2: Extract Volume & Market Cap Features (Full Lookback)**
-        # volume_features = historical_data[:, :, :, 4]
-        # market_cap_features = historical_data[:, :, :, 5]
 
         ## get batch_size
         batch_size = historical_data.size(0)
-        ## get num_channels
-        # num_channels = historical_data.size(1)
-        # ## get lookback
-        # lookback = historical_data.size(2)
-        
         
         # **Extract Key Price Signals**
         # Compute overall mean price including Open, High, Low, and Close
@@ -117,14 +103,14 @@ class BaselineModel(nn.Module):
         raw_low_prices = historical_data[:, :, :, 2].min(dim=2).values.unsqueeze(2).unsqueeze(3).expand(-1, -1, self.horizon, self.num_outputs)
         ## method 3:
         # **Define Learnable Logits**
-        logits = self.price_mixture_logits  # [num_channels, num_outputs, horizon, 4]
+        logits = self.price_mixture_logits  # [num_channels, horizon, num_outputs, 4]
 
         # **Apply Softmax to Get Simplex-Consistent Weights**
         weights = torch.softmax(logits, dim=-1)  # [num_channels, num_outputs, 4] - 4 components
         print(f"weights: {weights.size()}")
 
-        weights = weights.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)  # [batch_size, num_channels, num_outputs, horizon, 4]
-        w_close, w_recent, w_high, w_low = weights.split(1, dim=-1)  # Still [batch_size, num_channels, num_outputs, horizon, 1]
+        weights = weights.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)  # [batch_size, num_channels, horizon, num_outputs, 4]
+        w_close, w_recent, w_high, w_low = weights.split(1, dim=-1)  
 
         # Remove last dimension without affecting batch structure
         w_close = w_close.squeeze(-1)
@@ -143,7 +129,7 @@ class BaselineModel(nn.Module):
             w_high * raw_high_prices +
             w_low * raw_low_prices
         )
-        
+
         return weighted_prices
 
 
@@ -172,6 +158,7 @@ class CommonMetricsModel(nn.Module):
         self.num_channels = config.data_props.num_channels
         self.lookback = config.data_props.lookback
         self.horizon = config.data_props.horizon
+        self.window = self.horizon
 
         # Model properties
         self.output_quantiles = config.model.output_quantiles
@@ -179,8 +166,9 @@ class CommonMetricsModel(nn.Module):
 
         # Multi-Layer Perceptron (MLP) for Bollinger Bands
         self.bollinger_bands_mlp = MLPBlock(
-            input_size=1, output_size=1, num_layers=4, hidden_size=64, dropout=0.1
+            input_size=(self.lookback - self.window + 1), output_size= 4 * self.num_outputs * self.horizon, num_layers=3, hidden_size=128, dropout=0.1
         )
+
 
         # Learnable logits for price mixture (ensuring sum-to-1 constraint via softmax)
         self.price_mixture_logits = nn.Parameter(torch.randn(self.num_channels, self.horizon, self.num_outputs, 4))
@@ -221,15 +209,32 @@ class CommonMetricsModel(nn.Module):
 
         # **Define Common Metrics**
         # Compute Bollinger Bands
-        bollinger_bands = statistical_bollinger_bands(close_price_means, window=14, num_std=2)
+        bollinger_bands = statistical_bollinger_bands(historical_data, window=14)
+        #print(f"bollinger_bands: {bollinger_bands['sma'].shape}")
+        #x_bollinger = torch.cat([bollinger_bands['sma'], bollinger_bands['std']], dim=2)
+        #print(f"x_bollinger: {x_bollinger.shape}")
+        bollinger_embeddings = self.bollinger_bands_mlp(bollinger_bands['std'])
+        print(f"bollinger_embeddings: {bollinger_embeddings.shape}")
+        ## reshape bollinger_embeddings to be [batch_size, num_channels, horizon, 4]
+        bollinger_embeddings = bollinger_embeddings.view(batch_size, self.num_channels, self.horizon, self.num_outputs, 4)
+        print(f"bollinger_embeddings: {bollinger_embeddings.shape}")
+        #breakpoint()
+        # sma = bollinger_bands['sma']
+        # sma_std = bollinger_bands['std']
+        
 
+        # Compute On-Balance Volume (OBV)
+        obv = compute_obv(historical_data)
+        print(f"obv: {obv.shape}")
 
         # **Define Learnable Logits**
         logits = self.price_mixture_logits  # [num_channels, num_outputs, horizon, 4]
+        logits = logits.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)  # [batch_size, num_channels, num_outputs, horizon, 4]
+        print(f"logits: {logits.shape}")
 
         # **Apply Softmax to Get Simplex-Consistent Weights**
-        weights = torch.softmax(logits, dim=-1)  # [num_channels, num_outputs, 4] - 4 components
-        print(f"weights: {weights.size()}")
+        weights = torch.softmax(logits * bollinger_embeddings, dim=-1)  # [num_channels, num_outputs, 4] - 4 components
+        print(f"weights: {weights.shape}")
 
         # **Split Weights into Components and Expand**
         # w_close, w_recent, w_high, w_low = weights.split(1, dim=-1)  # Keeps tensor structure
@@ -238,7 +243,7 @@ class CommonMetricsModel(nn.Module):
         # w_high = w_high.squeeze(-1).unsqueeze(0).unsqueeze(2).expand(-1, -1, self.horizon, -1)
         # w_low = w_low.squeeze(-1).unsqueeze(0).unsqueeze(2).expand(-1, -1, self.horizon, -1)
 
-        weights = weights.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)  # [batch_size, num_channels, num_outputs, horizon, 4]
+        #weights = weights.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)  # [batch_size, num_channels, num_outputs, horizon, 4]
         w_close, w_recent, w_high, w_low = weights.split(1, dim=-1)  # Still [batch_size, num_channels, num_outputs, horizon, 1]
 
         # Remove last dimension without affecting batch structure
@@ -258,5 +263,7 @@ class CommonMetricsModel(nn.Module):
             w_high * raw_high_prices +
             w_low * raw_low_prices
         )
+
+        print(f"weighted_prices: {weighted_prices.shape}")
           
         return weighted_prices
