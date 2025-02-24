@@ -6,6 +6,7 @@ from typing import List, Dict, Tuple, Optional, Any
 from torch import Tensor
 import matplotlib.pyplot as plt
 import numpy as np
+import torch.distributions as dist
 
 
 def plot_predictions(
@@ -154,7 +155,7 @@ def bollinger_bands(x: torch.Tensor, window: int = 20, k: float = 2.0) -> dict:
 
 
 def statistical_bollinger_bands(x: torch.Tensor, 
-                                window: int = 20, 
+                                window: int = 14, 
                                 q_lower: float = 0.025, 
                                 q_upper: float = 0.975) -> dict:
     """
