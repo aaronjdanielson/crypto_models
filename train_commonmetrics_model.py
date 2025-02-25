@@ -74,12 +74,13 @@ train_config = {
     'training_dates': training_dates,
     'file_path': 'data/combined_data.csv',
     'date_attrs': ['day_of_week', 'month', 'day_of_month', 'quarter', 'year_since_earliest_date'],
+    'crypto_prices': ['Open', 'High', 'Low', 'Close'],
     'crypto_data_features': ['Open', 'High', 'Low', 'Close', 'Volume', 'Market Cap'],
 }
 
 # Generate dynamic model filename based on configuration
 
-model_type = "baseline"
+model_type = "commonmetrics"
 
 #model_type += f"_main_method_{config.model.main_method}"
 
@@ -102,6 +103,7 @@ def train_model(model_config=config, train_config=train_config):
         lookback=model_config.data_props.lookback,
         horizon=model_config.data_props.horizon,
         date_attrs=train_config['date_attrs'],
+        crypto_prices=train_config['crypto_prices'],
         crypto_data_features=train_config['crypto_data_features'],
         date_ranges=train_config['training_dates'],
         split="train",
@@ -112,6 +114,7 @@ def train_model(model_config=config, train_config=train_config):
         lookback=model_config.data_props.lookback,
         horizon=model_config.data_props.horizon,
         date_attrs=train_config['date_attrs'],
+        crypto_prices=train_config['crypto_prices'],
         crypto_data_features=train_config['crypto_data_features'],
         date_ranges=train_config['training_dates'],
         split="validation",
