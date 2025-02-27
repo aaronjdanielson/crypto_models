@@ -64,10 +64,10 @@ training_dates = {
     }
 
 train_config = {
-    'batch_size': 64,
+    'batch_size': 32,
     'num_epochs': 200,
-    'learning_rate': 1e-2,  ## use 1e-2 for non-deep prediction
-    'weight_decay': 1e-4,  ## use 1e-4 for non-deep prediction
+    'learning_rate': 5e-3,  ## use 1e-2 for non-deep prediction
+    'weight_decay': 1e-5,  ## use 1e-4 for non-deep prediction
     'early_stopping_patience': 5,
     'miniumum_epochs': 5,
     'device': torch.device("mps" if torch.backends.mps.is_available() and torch.backends.mps.is_built() else "cpu"),
