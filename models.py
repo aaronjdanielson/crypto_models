@@ -4,7 +4,7 @@ from torch import nn
 import torch.nn.functional as F
 import math
 from typing import List, Dict, Tuple, Optional, Any
-from functions import statistical_bollinger_bands, compute_obv, compute_stochastic_oscillator
+from functions import compute_volume_change, compute_rolling_cmf, compute_rolling_vwma, compute_rolling_mfi, statistical_bollinger_bands, compute_obv, compute_rolling_rsi, compute_stochastic_oscillator
 from modules import MLPBlock
 #from modules import ExpDecayLinearRegressionSlope, ChannelTimeFusion, DynamicHorizonScaler
 
@@ -142,9 +142,29 @@ class CommonMetricsModel(nn.Module):
     ----------
     config: dict
         Configuration dictionary with the model and data properties.
-    
-    Returns: Dict
-        Dictionary with the predicted quantiles, historical weights, future weights, and attention scores.
+
+            num_historical_features: int
+                Number of historical features per channel.
+                ['Open', 'High', 'Low', 'Close', 'Volume', 'Market Cap']
+
+            num_time_features: int
+                Number of time features per time step.
+                ['day_of_week', 'month', 'day_of_month', 'quarter', 'year_since_earliest_date']
+
+            num_channels: int
+                Number of channels in the dataset.
+
+            lookback: int
+                Number of historical time steps to consider.
+
+            horizon: int
+                Number of future time steps to predict.
+
+            output_quantiles: List[float]
+                List of quantiles to predict.
+
+    Returns: Tensor
+        Tensor with the predicted quantiles.
     """
 
     def __init__(self, config: Config):
@@ -166,8 +186,30 @@ class CommonMetricsModel(nn.Module):
 
         # Multi-Layer Perceptron (MLP) for Bollinger Bands
         self.bollinger_bands_mlp = MLPBlock(
-            input_size=(self.lookback - self.window + 1), output_size= 4 * self.num_outputs * self.horizon, num_layers=3, hidden_size=128, dropout=0.1
+            input_size= 2*(7), output_size= 4 * self.num_outputs, num_layers=3, hidden_size=32, dropout=0.1
         )
+
+        ## create channel embeddings
+        self.channel_embeddings = nn.Parameter(torch.randn(self.num_channels, 16))
+
+        # Multi-Layer Perceptron (MLP) for On-Balance Volume (OBV)
+        # self.obv_mlp = MLPBlock(
+        #     input_size= self.lookback, output_size= 4 * self.num_outputs, num_layers=3, hidden_size=64, dropout=0.1
+        # )
+
+        # Multi-Layer Perceptron (MLP) for Relative Strength Index (RSI)
+        self.rsi_mlp = MLPBlock(
+            input_size= self.lookback, output_size= 4 * self.horizon, num_layers=3, hidden_size=64, dropout=0.1
+        )
+
+        # self.volume_change_mlp = MLPBlock(
+        #     input_size= self.lookback -5, output_size= self.num_outputs * self.horizon, num_layers=3, hidden_size=64, dropout=0.1
+        # )
+
+        self.quantile_adjustment_embeddings = MLPBlock(
+            input_size= 7*3 + 16, output_size= self.num_outputs * self.horizon, num_layers=3, hidden_size=32, dropout=0.1
+        )
+        #nn.Parameter(torch.randn(self.num_channels, self.horizon, self.num_outputs))
 
 
         # Learnable logits for price mixture (ensuring sum-to-1 constraint via softmax)
@@ -187,9 +229,11 @@ class CommonMetricsModel(nn.Module):
         # open_prices = historical_data[:, :, :, 0]
 
         # **Step 2: Extract Volume & Market Cap Features (Full Lookback)**
-        # volume_features = historical_data[:, :, :, 4]
-        # market_cap_features = historical_data[:, :, :, 5]
+        volume_features = historical_data[:, :, :, 4]
+        market_cap_features = historical_data[:, :, :, 5]
 
+        #print(f"volume_features: {volume_features}")
+        #print(f"market_cap_features: {market_cap_features}")
         ## get batch_size
         batch_size = historical_data.size(0)
         ## get num_channels
@@ -211,37 +255,89 @@ class CommonMetricsModel(nn.Module):
         # Compute Bollinger Bands
         bollinger_bands = statistical_bollinger_bands(historical_data, window=14)
         #print(f"bollinger_bands: {bollinger_bands['sma'].shape}")
-        #x_bollinger = torch.cat([bollinger_bands['sma'], bollinger_bands['std']], dim=2)
+        x_bollinger = torch.cat([bollinger_bands['sma'][:, :, -7:], bollinger_bands['std'][:, :, -7:]], dim=2)
         #print(f"x_bollinger: {x_bollinger.shape}")
-        bollinger_embeddings = self.bollinger_bands_mlp(bollinger_bands['std'])
-        print(f"bollinger_embeddings: {bollinger_embeddings.shape}")
+        #bollinger_embeddings = self.bollinger_bands_mlp(bollinger_bands['std'])
+        #print(f"bollinger_embeddings: {bollinger_embeddings.shape}")
+        bollinger_embeddings = self.bollinger_bands_mlp(x_bollinger)
+        #print(f"bollinger_embeddings: {bollinger_embeddings.shape}")
         ## reshape bollinger_embeddings to be [batch_size, num_channels, horizon, 4]
-        bollinger_embeddings = bollinger_embeddings.view(batch_size, self.num_channels, self.horizon, self.num_outputs, 4)
-        print(f"bollinger_embeddings: {bollinger_embeddings.shape}")
-        #breakpoint()
-        # sma = bollinger_bands['sma']
-        # sma_std = bollinger_bands['std']
+        bollinger_embeddings = bollinger_embeddings.view(batch_size, self.num_channels, self.num_outputs, 4)
+        #print(f"bollinger_embeddings: {bollinger_embeddings.shape}")
+        #expanding bollinger_embeddings to match the shape of logits
+        bollinger_embeddings = bollinger_embeddings.unsqueeze(2).expand(-1, -1, self.horizon, -1, -1)
         
-
         # Compute On-Balance Volume (OBV)
         obv = compute_obv(historical_data)
         print(f"obv: {obv.shape}")
+        # get last 7 values of obv
+        obv = obv[:, :, -7:]
+
+        # Compute On-Balance Volume (OBV)
+        rsi = compute_rolling_rsi(historical_data)
+        print(f"rsi: {rsi.shape}")
+        # get last 7 values of rsi
+        rsi = rsi[:, :, -7:]
+
+        stochastic_oscillator =  compute_stochastic_oscillator(historical_data)
+        print(f"stochastic_oscillator: {stochastic_oscillator['percent_d'].shape}")
+        ## get last 7 values of percent_d
+        stochastic_oscillator = stochastic_oscillator['percent_d'][:, :, -7:]
+
+        #vwma = compute_rolling_vwma(historical_data)
+        #print(f"vwma: {vwma.shape}")
+
+        #rsi_embeddings = self.rsi_mlp(torch.cat((obv), dim=2))
+
+        # rsi_embeddings = self.rsi_mlp(obv)
+        # print(f"rsi_embeddings: {rsi_embeddings.shape}")
+        ## reshape rsi_embeddings to be [batch_size, num_channels, horizon, 4]
+
+        # rsi_embeddings = rsi_embeddings.view(batch_size, self.num_channels, self.horizon, 4)
+        # print(f"rsi_embeddings: {rsi_embeddings.shape}")
+        # #expanding rsi_embeddings to match the shape of logits
+        # rsi_embeddings = rsi_embeddings.unsqueeze(3).expand(-1, -1, -1, self.num_outputs, -1)
+        # print(f"rsi_embeddings: {rsi_embeddings.shape}")
+
+        volume_change = compute_volume_change(historical_data[..., 4], period=5)
+        print(f"volume_change: {volume_change.shape}")
+        ## get last 7 values of volume_change
+        volume_change = volume_change[:, :, -7:]
+        #breakpoint()
+
+        # volume_change_embeddings = self.volume_change_mlp(volume_change)
+        # print(f"volume_change_embeddings: {volume_change_embeddings.shape}")
+        # ## reshape volume_change_embeddings to be [batch_size, num_channels, horizon, 4]
+        # volume_change_embeddings = volume_change_embeddings.view(batch_size, self.num_channels, self.horizon, self.num_outputs)
+        # print(f"volume_change_embeddings: {volume_change_embeddings.shape}")
+        # #expanding volume_change_embeddings to match the shape of logits
+
+        # Compute a quantile adjustment factor
+        # reshape channel_embeddings to be [batch_size, num_channels, 1, 32]
+
+        #channel_embeddings = self.channel_embeddings.unsqueeze(0).expand(batch_size, -1)
+        channel_embeddings = self.channel_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
+        print(f"channel_embeddings: {channel_embeddings.shape}")
+        quantile_adjustment_embeddings = self.quantile_adjustment_embeddings(torch.cat((volume_change, rsi, obv, channel_embeddings), dim=2))
+        print(f"quantile_adjustment_embeddings: {quantile_adjustment_embeddings.shape}")
+        ## reshape quantile_adjustment_embeddings to be [batch_size, num_channels, horizon, 4]
+        quantile_adjustment_embeddings = quantile_adjustment_embeddings.view(batch_size, self.num_channels, self.horizon, self.num_outputs)
 
         # **Define Learnable Logits**
         logits = self.price_mixture_logits  # [num_channels, num_outputs, horizon, 4]
         logits = logits.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)  # [batch_size, num_channels, num_outputs, horizon, 4]
-        print(f"logits: {logits.shape}")
+        #print(f"logits: {logits.shape}")
+
+        # Compute scaling factors using embeddings
+        scaling_factors = torch.sigmoid(bollinger_embeddings)# + stochastic_embeddings)
+
+        # Apply to logits before softmax
+        logits = self.price_mixture_logits * (1 + scaling_factors)
+
 
         # **Apply Softmax to Get Simplex-Consistent Weights**
-        weights = torch.softmax(logits * bollinger_embeddings, dim=-1)  # [num_channels, num_outputs, 4] - 4 components
-        print(f"weights: {weights.shape}")
-
-        # **Split Weights into Components and Expand**
-        # w_close, w_recent, w_high, w_low = weights.split(1, dim=-1)  # Keeps tensor structure
-        # w_close = w_close.squeeze(-1).unsqueeze(0).unsqueeze(2).expand(-1, -1, self.horizon, -1)
-        # w_recent = w_recent.squeeze(-1).unsqueeze(0).unsqueeze(2).expand(-1, -1, self.horizon, -1)
-        # w_high = w_high.squeeze(-1).unsqueeze(0).unsqueeze(2).expand(-1, -1, self.horizon, -1)
-        # w_low = w_low.squeeze(-1).unsqueeze(0).unsqueeze(2).expand(-1, -1, self.horizon, -1)
+        weights = torch.softmax(logits, dim=-1)  # [num_channels, num_outputs, 4] - 4 components
+        #print(f"weights: {weights.shape}")
 
         #weights = weights.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)  # [batch_size, num_channels, num_outputs, horizon, 4]
         w_close, w_recent, w_high, w_low = weights.split(1, dim=-1)  # Still [batch_size, num_channels, num_outputs, horizon, 1]
@@ -252,8 +348,8 @@ class CommonMetricsModel(nn.Module):
         w_high = w_high.squeeze(-1)
         w_low = w_low.squeeze(-1)
 
-        print(w_close.size())
-        print(close_price_means.size())
+        #print(w_close.size())
+        #print(close_price_means.size())
 
 
         # **Compute Final Weighted Forecast**
@@ -265,5 +361,14 @@ class CommonMetricsModel(nn.Module):
         )
 
         print(f"weighted_prices: {weighted_prices.shape}")
+
+        # Compute a quantile adjustment factor
+        quantile_adjustment = torch.tanh(quantile_adjustment_embeddings)
+
+        # Adjust predicted quantiles
+        #adjusted_predictions = weighted_prices * (1 + quantile_adjustment * 0.1)  # 10% scaling limit
+
+        adjusted_predictions = weighted_prices  + (quantile_adjustment * 0.1)  # 10% scaling limit
+
           
-        return weighted_prices
+        return adjusted_predictions
