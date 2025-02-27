@@ -166,6 +166,25 @@ def bollinger_bands(x: torch.Tensor, window: int = 20, k: float = 2.0) -> dict:
         'median_band': median_band  # Alternative method
     }
 
+def compute_volume_change(volume: torch.Tensor, period: int = 5) -> torch.Tensor:
+    """
+    Compute the percentage change in trading volume over a rolling window.
+    """
+    prev_volume = volume[..., :-period]
+    current_volume = volume[..., period:]
+    return ((current_volume - prev_volume) / (prev_volume + 1e-8)) * 100  # Avoid division by zero
+
+def compute_roc(close_prices: torch.Tensor, period: int = 3) -> torch.Tensor:
+    """
+    Compute Rate of Change (ROC) over a rolling window.
+    
+    ROC = ((Close_t - Close_{t-period}) / Close_{t-period}) * 100
+    """
+    prev_close = close_prices[..., :-period]  # Shifted prices
+    current_close = close_prices[..., period:]
+    roc = ((current_close - prev_close) / (prev_close + 1e-8)) * 100  # Avoid division by zero
+    return roc
+
 
 def statistical_bollinger_bands(x: torch.Tensor, 
                                 window: int = 14, 
@@ -501,6 +520,192 @@ def compute_macd(x: torch.Tensor, lam_fast: float, lam_slow: float, lam_signal: 
         'histogram': histogram
     }
 
+def compute_rolling_market_cap_adjusted_rsi(close_prices: torch.Tensor, market_caps: torch.Tensor, period: int = 14) -> torch.Tensor:
+    """
+    Compute the Market Cap Adjusted RSI over rolling windows in the data.
+
+    This is an extension of the standard RSI that incorporates market capitalization weights.
+    It smooths the price movements using a rolling window approach.
+
+    Parameters
+    ----------
+    close_prices : torch.Tensor
+        Closing prices of shape `[batch_size, num_cryptos, lookback]`.
+    market_caps : torch.Tensor
+        Market capitalizations of shape `[batch_size, num_cryptos, lookback]`.
+    period : int, default=14
+        The rolling window size for RSI calculation.
+
+    Returns
+    -------
+    rsi : torch.Tensor
+        The computed Market Cap Adjusted RSI over rolling windows.
+        Shape: `[batch_size, num_cryptos, lookback - period + 1]`.
+    """
+    # Compute price differences; shape: [B, C, L-1]
+    delta = close_prices[..., 1:] - close_prices[..., :-1]
+
+    # Compute upward and downward movements
+    U = torch.clamp(delta, min=0)  # Positive changes
+    D = torch.clamp(-delta, min=0)  # Negative changes
+
+    # Normalize market caps across cryptos within each batch
+    #market_cap_weights = market_caps / market_caps.sum(dim=1, keepdim=True)  # Shape: [B, C, L]
+    market_cap_weights = market_cap_weights[..., :-1]  # Align with U/D shape [B, C, L-1]
+
+    # Apply market cap weighting
+    U_weighted = U * market_cap_weights
+    D_weighted = D * market_cap_weights
+
+    # Create rolling windows
+    U_windows = U_weighted.unfold(-1, period, 1)  # Shape: [B, C, num_windows, period]
+    D_windows = D_weighted.unfold(-1, period, 1)  # Shape: [B, C, num_windows, period]
+
+    # Compute rolling mean (Wilder's smoothing approximation)
+    smma_U = U_windows.mean(dim=-1)  # Shape: [B, C, num_windows]
+    smma_D = D_windows.mean(dim=-1)  # Shape: [B, C, num_windows]
+
+    # Compute Relative Strength (RS) and RSI
+    eps = 1e-8  # Avoid division by zero
+    RS = smma_U / (smma_D + eps)
+    rsi = 100 - (100 / (1 + RS))
+
+    return rsi
+
+
+def compute_rolling_mfi(x: torch.Tensor, period: int = 14) -> torch.Tensor:
+    """
+    Compute the Money Flow Index (MFI) over rolling windows.
+    
+    MFI measures buying and selling pressure using price and volume.
+    
+    Parameters:
+    ----------
+    x : torch.Tensor
+        Shape: `[batch_size, num_cryptos, lookback, num_features]`
+        Features: `['Open', 'High', 'Low', 'Close', 'Volume', 'Market Cap']`
+    period : int, default=14
+        The rolling window size.
+    
+    Returns:
+    -------
+    mfi : torch.Tensor
+        Shape: `[batch_size, num_cryptos, lookback - period + 1]`
+    """
+    # Extract necessary values
+    high, low, close, volume = x[..., 1], x[..., 2], x[..., 3], x[..., 4]
+
+    # Compute the Typical Price (TP)
+    tp = (high + low + close) / 3
+
+    # Compute Raw Money Flow (TP * Volume)
+    money_flow = tp * volume
+
+    # Compute price change and determine positive/negative flow
+    delta = tp[..., 1:] - tp[..., :-1]
+    positive_flow = torch.where(delta > 0, money_flow[..., 1:], torch.zeros_like(money_flow[..., 1:]))
+    negative_flow = torch.where(delta < 0, money_flow[..., 1:], torch.zeros_like(money_flow[..., 1:]))
+
+    # Compute rolling sums
+    pos_flow_windows = positive_flow.unfold(-1, period, 1).sum(dim=-1)
+    neg_flow_windows = negative_flow.unfold(-1, period, 1).sum(dim=-1)
+
+    # Compute Money Flow Ratio
+    mf_ratio = pos_flow_windows / (neg_flow_windows + 1e-8)  # Avoid division by zero
+
+    # Compute MFI
+    mfi = 100 - (100 / (1 + mf_ratio))
+
+    return mfi
+
+def compute_adl(x: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the Accumulation/Distribution Line (ADL).
+    
+    Parameters:
+    ----------
+    x : torch.Tensor
+        Shape: `[batch_size, num_cryptos, lookback, num_features]`
+        Features: `['Open', 'High', 'Low', 'Close', 'Volume', 'Market Cap']`
+    
+    Returns:
+    -------
+    adl : torch.Tensor
+        Shape: `[batch_size, num_cryptos, lookback]`
+    """
+    # Extract necessary values
+    high, low, close, volume = x[..., 1], x[..., 2], x[..., 3], x[..., 4]
+
+    # Compute the Money Flow Multiplier (MFM)
+    mfm = ((close - low) - (high - close)) / (high - low + 1e-8)  # Avoid division by zero
+
+    # Compute Money Flow Volume (MFV)
+    mfv = mfm * volume
+
+    # Compute the cumulative sum along the time dimension
+    adl = mfv.cumsum(dim=-1)
+
+    return adl
+
+
+def compute_rolling_cmf(x: torch.Tensor, window: int = 20) -> torch.Tensor:
+    """
+    Compute the Chaikin Money Flow (CMF) over a rolling window.
+    
+    Parameters:
+    ----------
+    x : torch.Tensor
+        Shape: `[batch_size, num_cryptos, lookback, num_features]`
+        Features: `['Open', 'High', 'Low', 'Close', 'Volume', 'Market Cap']`
+    window : int, default=20
+        The rolling window size.
+    
+    Returns:
+    -------
+    cmf : torch.Tensor
+        Shape: `[batch_size, num_cryptos, lookback - window + 1]`
+    """
+    # Compute ADL
+    adl = compute_adl(x)
+
+    # Compute rolling sums
+    adl_windows = adl.unfold(-1, window, 1).sum(dim=-1)
+    volume_windows = x[..., 4].unfold(-1, window, 1).sum(dim=-1)
+
+    # Compute CMF
+    cmf = adl_windows / (volume_windows + 1e-8)  # Avoid division by zero
+
+    return cmf
+
+def compute_rolling_vwma(x: torch.Tensor, window: int = 20) -> torch.Tensor:
+    """
+    Compute the Volume-Weighted Moving Average (VWMA) over a rolling window.
+    
+    Parameters:
+    ----------
+    x : torch.Tensor
+        Shape: `[batch_size, num_cryptos, lookback, num_features]`
+        Features: `['Open', 'High', 'Low', 'Close', 'Volume', 'Market Cap']`
+    window : int, default=20
+        The moving average window size.
+    
+    Returns:
+    -------
+    vwma : torch.Tensor
+        Shape: `[batch_size, num_cryptos, lookback - window + 1]`
+    """
+    # Extract necessary values
+    close, volume = x[..., 3], x[..., 4]
+
+    # Compute rolling sum of (price * volume) and volume
+    price_volume_windows = (close * volume).unfold(-1, window, 1).sum(dim=-1)
+    volume_windows = volume.unfold(-1, window, 1).sum(dim=-1)
+
+    # Compute VWMA
+    vwma = price_volume_windows / (volume_windows + 1e-8)  # Avoid division by zero
+
+    return vwma
+
 
 def compute_rolling_rsi(x: torch.Tensor, period: int = 14) -> torch.Tensor:
     """
@@ -695,51 +900,51 @@ def compute_market_cap_adjusted_rsi(close_prices, market_caps, period=14):
 #     return stochastic_oscillator
 
 
-def compute_stochastic_oscillator(x: torch.Tensor, period: int = 14) -> dict:
-    """
-    Compute the Stochastic Oscillator (%K and %D) over rolling windows.
+# def compute_stochastic_oscillator(x: torch.Tensor, period: int = 14) -> dict:
+#     """
+#     Compute the Stochastic Oscillator (%K and %D) over rolling windows.
     
-    The Stochastic Oscillator measures the position of the closing price relative 
-    to its recent high-low range, helping identify overbought and oversold conditions.
+#     The Stochastic Oscillator measures the position of the closing price relative 
+#     to its recent high-low range, helping identify overbought and oversold conditions.
     
-    It is calculated as:
+#     It is calculated as:
     
-        %K = ((Close - Lowest Low) / (Highest High - Lowest Low)) * 100
-        %D = Moving Average of %K
+#         %K = ((Close - Lowest Low) / (Highest High - Lowest Low)) * 100
+#         %D = Moving Average of %K
     
-    Parameters
-    ----------
-    x : torch.Tensor
-        Input tensor with shape `[batch_size, num_channels, lookback, num_features]`.
-        The features are assumed to be ordered as:
-        `['Open', 'High', 'Low', 'Close', 'Volume', 'Market Cap']`.
-    period : int, default=14
-        The period over which to compute the oscillator.
+#     Parameters
+#     ----------
+#     x : torch.Tensor
+#         Input tensor with shape `[batch_size, num_channels, lookback, num_features]`.
+#         The features are assumed to be ordered as:
+#         `['Open', 'High', 'Low', 'Close', 'Volume', 'Market Cap']`.
+#     period : int, default=14
+#         The period over which to compute the oscillator.
     
-    Returns
-    -------
-    stochastic : dict
-        Dictionary containing:
-        - `'percent_k'` (Tensor): %K line, shape `[batch_size, num_channels, lookback - period + 1]`
-        - `'percent_d'` (Tensor): 3-period moving average of %K
-    """
-    high = x[..., 1]  # High prices
-    low = x[..., 2]   # Low prices
-    close = x[..., 3] # Closing prices
+#     Returns
+#     -------
+#     stochastic : dict
+#         Dictionary containing:
+#         - `'percent_k'` (Tensor): %K line, shape `[batch_size, num_channels, lookback - period + 1]`
+#         - `'percent_d'` (Tensor): 3-period moving average of %K
+#     """
+#     high = x[..., 1]  # High prices
+#     low = x[..., 2]   # Low prices
+#     close = x[..., 3] # Closing prices
 
-    # Compute rolling min and max
-    lowest_low = low.unfold(-1, period, 1).min(dim=-1)[0]
-    highest_high = high.unfold(-1, period, 1).max(dim=-1)[0]
+#     # Compute rolling min and max
+#     lowest_low = low.unfold(-1, period, 1).min(dim=-1)[0]
+#     highest_high = high.unfold(-1, period, 1).max(dim=-1)[0]
 
-    # Compute %K (Stochastic Oscillator)
-    percent_k = 100 * (close[..., period-1:] - lowest_low) / (highest_high - lowest_low + 1e-8)
+#     # Compute %K (Stochastic Oscillator)
+#     percent_k = 100 * (close[..., period-1:] - lowest_low) / (highest_high - lowest_low + 1e-8)
 
-    # Compute %D (3-period SMA of %K)
-    percent_d = percent_k.unfold(-1, 3, 1).mean(dim=-1)
+#     # Compute %D (3-period SMA of %K)
+#     percent_d = percent_k.unfold(-1, 3, 1).mean(dim=-1)
 
-    return {'percent_k': percent_k, 'percent_d': percent_d}
+#     return {'percent_k': percent_k, 'percent_d': percent_d}
 
-def stochastic_oscillator(x: torch.Tensor, window: int = 14, d_period: int = 3) -> dict:
+def compute_stochastic_oscillator(x: torch.Tensor, window: int = 14, d_period: int = 3) -> dict:
     """
     Compute the stochastic oscillator for a given input tensor.
     
@@ -782,7 +987,7 @@ def stochastic_oscillator(x: torch.Tensor, window: int = 14, d_period: int = 3) 
     close_last = close_windows[..., -1]  # shape: [B, C, T-window+1]
     
     # Compute %K: avoid division by zero by adding a small epsilon.
-    eps = 1e-8
+    eps = 1e-10
     percent_k = 100 * (close_last - lowest_low) / (highest_high - lowest_low + eps)  # shape: [B, C, T-window+1]
     
     # Optionally compute %D as the simple moving average of %K over d_period windows.
