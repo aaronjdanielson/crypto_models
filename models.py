@@ -186,11 +186,14 @@ class CommonMetricsModel(nn.Module):
 
         # Multi-Layer Perceptron (MLP) for Bollinger Bands
         self.bollinger_bands_mlp = MLPBlock(
-            input_size= 2*(7), output_size= 4 * self.num_outputs, num_layers=3, hidden_size=32, dropout=0.1
+            input_size= 2*(7) + 16, output_size= 4 * self.num_outputs, num_layers=3, hidden_size=32, dropout=0.1
         )
 
         ## create channel embeddings
         self.channel_embeddings = nn.Parameter(torch.randn(self.num_channels, 16))
+
+        ## create a parameter for the quantile adjustment
+        self.alpha = nn.Parameter(torch.randn(1, 1, 1, 1))
 
         # Multi-Layer Perceptron (MLP) for On-Balance Volume (OBV)
         # self.obv_mlp = MLPBlock(
@@ -207,7 +210,7 @@ class CommonMetricsModel(nn.Module):
         # )
 
         self.quantile_adjustment_embeddings = MLPBlock(
-            input_size= 7*3 + 16, output_size= self.num_outputs * self.horizon, num_layers=3, hidden_size=32, dropout=0.1
+            input_size= 7*5 + 16, output_size= self.num_outputs * self.horizon, num_layers=3, hidden_size=32, dropout=0.1
         )
         #nn.Parameter(torch.randn(self.num_channels, self.horizon, self.num_outputs))
 
@@ -251,12 +254,16 @@ class CommonMetricsModel(nn.Module):
         raw_high_prices = historical_data[:, :, :, 1].max(dim=2).values.unsqueeze(2).unsqueeze(3).expand(-1, -1, self.horizon, self.num_outputs)
         raw_low_prices = historical_data[:, :, :, 2].min(dim=2).values.unsqueeze(2).unsqueeze(3).expand(-1, -1, self.horizon, self.num_outputs)
 
+        channel_embeddings = self.channel_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
+        print(f"channel_embeddings: {channel_embeddings.shape}")
+
         # **Define Common Metrics**
         # Compute Bollinger Bands
         bollinger_bands = statistical_bollinger_bands(historical_data, window=14)
         #print(f"bollinger_bands: {bollinger_bands['sma'].shape}")
-        x_bollinger = torch.cat([bollinger_bands['sma'][:, :, -7:], bollinger_bands['std'][:, :, -7:]], dim=2)
-        #print(f"x_bollinger: {x_bollinger.shape}")
+        #print(f"bollinger_bands: {bollinger_bands['std'][:, :, -7:].shape}")
+        x_bollinger = torch.cat((bollinger_bands['sma'][:, :, -7:], bollinger_bands['std'][:, :, -7:],channel_embeddings), dim=2)
+        print(f"x_bollinger: {x_bollinger.shape}")
         #bollinger_embeddings = self.bollinger_bands_mlp(bollinger_bands['std'])
         #print(f"bollinger_embeddings: {bollinger_embeddings.shape}")
         bollinger_embeddings = self.bollinger_bands_mlp(x_bollinger)
@@ -316,9 +323,9 @@ class CommonMetricsModel(nn.Module):
         # reshape channel_embeddings to be [batch_size, num_channels, 1, 32]
 
         #channel_embeddings = self.channel_embeddings.unsqueeze(0).expand(batch_size, -1)
-        channel_embeddings = self.channel_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
-        print(f"channel_embeddings: {channel_embeddings.shape}")
-        quantile_adjustment_embeddings = self.quantile_adjustment_embeddings(torch.cat((volume_change, rsi, obv, channel_embeddings), dim=2))
+        #channel_embeddings = self.channel_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
+        #print(f"channel_embeddings: {channel_embeddings.shape}")
+        quantile_adjustment_embeddings = self.quantile_adjustment_embeddings(torch.cat((volume_change, rsi, obv, x_bollinger), dim=2))
         print(f"quantile_adjustment_embeddings: {quantile_adjustment_embeddings.shape}")
         ## reshape quantile_adjustment_embeddings to be [batch_size, num_channels, horizon, 4]
         quantile_adjustment_embeddings = quantile_adjustment_embeddings.view(batch_size, self.num_channels, self.horizon, self.num_outputs)
@@ -365,10 +372,14 @@ class CommonMetricsModel(nn.Module):
         # Compute a quantile adjustment factor
         quantile_adjustment = torch.tanh(quantile_adjustment_embeddings)
 
+        alpha_signal = torch.sigmoid(self.alpha)
+
         # Adjust predicted quantiles
         #adjusted_predictions = weighted_prices * (1 + quantile_adjustment * 0.1)  # 10% scaling limit
 
-        adjusted_predictions = weighted_prices  + (quantile_adjustment * 0.1)  # 10% scaling limit
+
+        adjusted_predictions = weighted_prices  + (quantile_adjustment * alpha_signal)  # 10% scaling limit
+
 
           
         return adjusted_predictions
